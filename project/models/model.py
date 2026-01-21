@@ -12,7 +12,7 @@ class AssembledFusionModel(nn.Module):
         super().__init__()
         # 保留原始 cfg 引用，以防子模块需要访问不同层级的配置
         self.full_cfg = cfg
-        self.model_cfg = cfg.assembled_model
+        self.model_cfg = cfg.model.assembled_model
 
         # 1. Vision Encoder
         self.vision_encoder = VisionEncoder(cfg)
@@ -27,29 +27,34 @@ class AssembledFusionModel(nn.Module):
         # 获取总层数，默认为 12
         self.num_layers = getattr(cfg, 'num_layers', 24)
         self.start_classify = getattr(cfg, 'start_classify', 1)
+        self.reasoning_stage_count = 0
 
         self.transformer_blocks = nn.ModuleList()
         self.class_heads = nn.ModuleList()
 
         # 构建交替层结构：Sensing -> Reasoning -> Sensing -> Reasoning ...
         for i in range(self.num_layers):
-            # 逻辑定义: 
-            # 偶数层 (0, 2, 4...) -> Sensing (if_query=False)
-            # 奇数层 (1, 3, 5...) -> Reasoning (if_query=True)
-            is_reasoning_layer = (i % 2 != 0)
+            # 逻辑定义:
+            # 偶数层 (0, 2, 4...) -> Sensing (if_query=True)
+            # 奇数层 (1, 3, 5...) -> Reasoning (if_query=False)
+            is_sensing_layer = (i % 2 == 0)
 
             # 添加 Transformer Block
-            block = FusionTransformerBlock2(cfg, if_query=is_reasoning_layer)
+            # 注意：FusionTransformerBlock2 的 if_query 参数含义是 "是否进行 Query-Image 交互"
+            block = FusionTransformerBlock2(cfg, if_query=is_sensing_layer )
             self.transformer_blocks.append(block)
 
             # 如果是 Reasoning 层，则挂载一个分类头
-            if is_reasoning_layer and (i+1) / 2 == self.start_classify:
-                head = MultitaskClassifier(cfg)
-                self.class_heads.append(head)
-            else:
-                # 为了保持索引对齐（或者单纯占位），这里不需要添加，
-                # 但为了 forward 写法简单，我们在 ModuleList 里只存存在的 head
-                pass
+            if not is_sensing_layer:
+                self.reasoning_stage_count += 1
+
+                # [逻辑优化]
+                # 只有当当前的 reasoning 阶段 >= start_classify 时才添加头
+                # 例如 start=1，则第1、2、3...个 reasoning layer 都有头 (Deep Supervision)
+                # 如果只想在最后一层加，可以在这里改逻辑
+                if self.reasoning_stage_count >= self.start_classify:
+                    head = MultitaskClassifier(cfg)
+                    self.class_heads.append(head)
 
     def _process_visual_sequence(self, pixel_values, batch_size, patches_num):
         """
@@ -85,50 +90,38 @@ class AssembledFusionModel(nn.Module):
                          value: 对应层的分类结果
         """
 
+        # --- [关键修改] 动态计算 Batch Size ---
+        # 即使 Dataloader drop_last=True，验证集最后也可能变小，绝不能用 cfg.batch_size
+        current_bs = pixel_values_1.shape[0] // self.full_cfg.data.patches_num
+
         # --- A. 基础特征提取 ---
-        vision_1_feat = self._process_visual_sequence(pixel_values_1, self.full_cfg.data.batch_size,
+        vision_1_feat = self._process_visual_sequence(pixel_values_1, current_bs,
                                                       self.full_cfg.data.patches_num)
-        vision_2_feat = self._process_visual_sequence(pixel_values_2, self.full_cfg.data.batch_size,
+        vision_2_feat = self._process_visual_sequence(pixel_values_2, current_bs,
                                                       self.full_cfg.data.patches_num)
+        # 获取视觉特征的 dtype (通常是 torch.bfloat16)
+        target_dtype = vision_1_feat.dtype
 
         # --- B. 位置编码 ---
-        pos_embed1 = self.pos_embedder(image_time=0)
-        pos_embed2 = self.pos_embedder(image_time=1)
-
-        vision_pos1 = pos_embed1
-        vision_pos2 = pos_embed2
+        # PosEmbedder 返回 FP32，为了进入主干计算，建议转为 target_dtype (BF16)
+        # 这样 x + pos_embed 也是 BF16
+        vision_pos1 = self.pos_embedder(current_bs, image_time=0).to(target_dtype)
+        vision_pos2 = self.pos_embedder(current_bs, image_time=1).to(target_dtype)
 
         # --- C. Query 初始化 ---
         # 已扩展到 Batch 维度(Batch, Num_Queries, Dim)
-        q_t1, q_t2 = self.query_generator.get_queries()
+        q_t1 = self.query_generator(current_bs).to(target_dtype)
+        q_t2 = self.query_generator(current_bs).to(target_dtype)
 
         # --- D. 循环处理 (Sensing-Reasoning) ---
         all_results = {}
         head_idx = 0  # 用于追踪当前用到第几个 head
 
         for i, block in enumerate(self.transformer_blocks):
-            # 检查当前层是否为 Reasoning 层 (奇数层: 1, 3, 5...)
-            is_reasoning_layer = (i % 2 != 0)
+            # 检查当前层是否为 sensing 层 (偶数数层: 0, 2, 4...)
+            is_sensing_layer = (i % 2 == 0)
 
-            if is_reasoning_layer:
-
-                # 执行 Transformer Block reasoning层，不需要query vision feature
-                q_t1, q_t2 = block(
-                    q_t1=q_t1,
-                    q_t2=q_t2,
-                )
-
-                if (i+1) / 2 == self.start_classify:
-                    # 获取对应的 Head
-                    current_head = self.class_heads[head_idx]
-                    # 计算分类结果
-                    layer_results = current_head(q_t1, q_t2)
-                    # 存入结果字典，Key 建议带上层号以便区分
-                    all_results[f'Classifier{head_idx+1}_results'] = layer_results
-                    # Head 索引递增
-                    head_idx += 1
-            else:
-
+            if is_sensing_layer:
                 # 执行 Transformer Block sensing 层，query vision feature
                 q_t1, q_t2 = block(
                     q_t1=q_t1,
@@ -138,5 +131,23 @@ class AssembledFusionModel(nn.Module):
                     vision_pos1=vision_pos1,
                     vision_pos2=vision_pos2
                 )
+
+            else:
+                # 执行 Transformer Block reasoning层，不需要query vision feature
+                q_t1, q_t2 = block(
+                    q_t1=q_t1,
+                    q_t2=q_t2,
+                )
+
+                if (i+1) / 2 >= self.start_classify:
+                    # 获取对应的 Head
+                    current_head = self.class_heads[head_idx]
+                    # 计算分类结果
+                    layer_results = current_head(q_t1, q_t2)
+                    # 存入结果字典，Key 建议带上层号以便区分
+                    all_results[f'ClassifyLayer_{head_idx+1}'] = layer_results
+                    # Head 索引递增
+                    head_idx += 1
+
 
         return all_results

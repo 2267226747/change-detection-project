@@ -2,154 +2,293 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import pandas as pd
 
 
 class BinaryFocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=None, gamma=None, reduction=None):
         """
         Args:
-            alpha: 平衡因子 (0 < alpha < 1)，用于调整正负样本权重。
-            gamma: 聚焦参数 (gamma >= 0)，用于挖掘难分样本。
+            alpha: (Tensor) 长度等于 num_classes，每个子任务独立的 alpha
+            gamma: (float) 聚焦参数
         """
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
 
+        # 注册 alpha 为 buffer (不作为参数更新，但随模型保存)
+        if alpha is not None:
+            self.register_buffer('alpha', alpha)
+        else:
+            self.alpha = None
+
+        # 注册 gamma 为 buffer (不作为参数更新，但随模型保存)
+        if gamma is not None:
+            self.register_buffer('gamma', gamma)
+        else:
+            self.gamma = None
+
     def forward(self, logits, targets):
-        # BCEWithLogitsLoss = Sigmoid + BCELoss
+        """
+        [AMP优化]
+        无论输入是什么精度，这里强制转为 float32 计算。
+        因为 Sigmoid 和 Pow 在 BF16 下极易损失精度。
+        """
+        logits = logits.float()
+        targets = targets.float()
+
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
 
-        # 计算 p_t (预测概率)
         p = torch.sigmoid(logits)
-        # 如果 target=1, p_t = p; 如果 target=0, p_t = 1-p
         p_t = p * targets + (1 - p) * (1 - targets)
 
-        # 计算 alpha_t
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        # 动态获取 alpha
+        if self.alpha is not None:
+            # 确保 alpha 维度匹配: [Batch, N] -> alpha 需要是 [N] 或广播
+            # self.alpha 应该是 [num_classes]
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        else:
+            alpha_t = 0.25 * targets + 0.75 * (1 - targets)  # 默认值
 
-        # Focal Loss 公式
-        focal_loss = alpha_t * (1 - p_t) ** self.gamma * bce_loss
+        # 如果 gamma 为空，默认取 2.0
+        if self.gamma.numel() > 0:
+            gamma_val = self.gamma.to(dtype=torch.float32)
+        else:
+            gamma_val = 2.0
+
+        focal_loss = alpha_t * (1 - p_t) ** gamma_val * bce_loss
 
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
         else:
-            return focal_loss
+            return focal_loss  # 返回 [Batch, Num_Classes]
 
 
-class MultiLayerLoss(nn.Module):
+class MultiTaskLoss(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.loss_type = getattr(cfg.loss, 'type', 'BCE')
+        # [优化] 将 weights 转为 tensor buffer，方便 device 管理
+        layer_weights = getattr(cfg.loss, 'layer_weights', [1.0])
+        self.register_buffer('layer_weights', torch.tensor(layer_weights, dtype=torch.float32))
 
-        # --- 1. 获取 Loss 类型及参数 ---
-        # 默认为 BCE
-        self.loss_type = getattr(cfg.loss, 'loss_type', 'BCE')
+        # --- 核心：解析任务配置与构建 Loss ---
+        # cfg.loss.tasks 是一个字典结构 (DictConfig)
+        task_configs = cfg.loss.tasks
+        self.tasks = {}  # 存储每个任务的元数据
+        self.criteria = nn.ModuleDict()  # 存储每个任务对应的 Loss 函数
+        current_idx = 0
 
-        if self.loss_type == 'BCE':
-            # 获取 pos_weight (解决正负样本不平衡)
-            # 在 yaml 中通常配置为列表，如 [1.0, 5.0, 1.0]
-            pos_weight_list = getattr(cfg.loss, 'pos_weight', None)
-            if pos_weight_list is not None:
-                # 注册为 buffer，确保模型保存时包含它，但不会被优化器更新
-                self.register_buffer('pos_weight', torch.tensor(pos_weight_list))
+        # 遍历 YAML 中的 tasks
+        for task_name, task_cfg in task_configs.items():
+            num_classes = task_cfg.num_classes
+
+            # 1. 记录切片索引
+            self.tasks[task_name] = {
+                'start': current_idx,
+                'end': current_idx + num_classes
+            }
+            current_idx += num_classes
+
+            # 2. 构建该任务专属的 Loss Function
+            if self.loss_type == 'BCE':
+                # 获取该任务专属的 pos_weight
+                pos_w = getattr(task_cfg, 'pos_weight', [1.0] * num_classes)
+                pos_w_tensor = torch.tensor(pos_w, dtype=torch.float32)
+
+                # 创建带权重的 BCE
+                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor, reduction='none')
+
+            elif self.loss_type == 'Focal':
+                # 获取该任务专属的 alpha
+                alpha = getattr(task_cfg, 'focal_alpha', [0.25] * num_classes)
+                gamma = getattr(cfg.loss, 'focal_gamma', [2.0] * num_classes)  # gamma 通常全局统一
+
+                alpha_tensor = torch.tensor(alpha, dtype=torch.float32)
+                gamma_tensor = torch.tensor(gamma, dtype=torch.float32)
+                criterion = BinaryFocalLoss(alpha=alpha_tensor, gamma=gamma_tensor)
+
             else:
-                self.pos_weight = None
+                raise ValueError("Unknown Loss Type")
 
-            self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-            print(f"[Loss] Using BCEWithLogitsLoss (pos_weight={pos_weight_list})")
+            self.criteria[task_name] = criterion
 
-        elif self.loss_type == 'Focal':
-            # 获取 Focal Loss 参数
-            alpha = getattr(cfg.loss, 'focal_alpha', 0.25)
-            gamma = getattr(cfg.loss, 'focal_gamma', 2.0)
-
-            self.criterion = BinaryFocalLoss(alpha=alpha, gamma=gamma)
-            print(f"[Loss] Using BinaryFocalLoss (alpha={alpha}, gamma={gamma})")
-
-        else:
-            raise ValueError(f"Unsupported loss type: {self.loss_type}")
-
-        # --- 2. 定义层级权重 (Deep Supervision Weights) ---
-        # 假设 output 有 N 层，列表长度应为 N
-        self.layer_weights = getattr(cfg.loss, 'layer_weights', None)
-
-        # --- 3. 定义任务映射 ---
-        # Dict: {'group_name': [col_idx1, col_idx2]}
-        self.task_mapping = getattr(cfg.loss, 'task_indices', None)
+        print(f"[Loss] Initialized {self.loss_type} for tasks: {list(self.tasks.keys())}")
 
     def forward(self, model_outputs, targets):
         """
         Args:
-            model_outputs: Dict {'Classifier_1_results': task_dict, 'Classifier_2_results': task_dict, ...}
-            targets: Tensor [Batch, Num_Classes]
-
+            model_outputs: Dict {'layer_X': {'road': [B, 8], ...}}
+            targets: Tensor [Batch, Total_Cols] (所有任务标签拼接的大宽表)
         Returns:
-            total_loss: scalar (带梯度的总 Loss)
-            loss_dict: dict (无梯度的数值，用于日志记录)
+            total_loss: scalar (Tensor, 带梯度)
+            raw_stats: dict (包含所有细节数值，用于累积计算 Epoch 平均值)
+        [AMP优化]
+        确保所有 Loss 计算都在 FP32 下进行。
         """
+
+        # 1. Targets 统一转 FP32
+        targets = targets.float()
         total_loss = 0.0
-        loss_dict = {}
 
-        # 确保 BCE 的 pos_weight 在正确的 device 上 (防止多卡训练/不同设备时的报错)
-        if self.loss_type == 'BCE' and self.pos_weight is not None:
-            if self.criterion.pos_weight.device != targets.device:
-                self.criterion.pos_weight = self.pos_weight.to(targets.device)
+        # 确保 BCE pos_weight 的 device 正确
+        if self.loss_type == 'BCE':
+            for crit in self.criteria.values():
+                if crit.pos_weight is not None and crit.pos_weight.device != targets.device:
+                    crit.pos_weight = crit.pos_weight.to(targets.device)
 
-        # 获取并排序层级 Keys (Classifier_1, Classifier_2, ...)
+        # 获取层级 keys
         layer_keys = sorted(model_outputs.keys(), key=lambda x: int(x.split('_')[1]))
-        num_layers = len(layer_keys)
 
-        # 动态生成层权重 (如果 cfg 未定义)
-        if self.layer_weights is None:
-            # 默认策略: 最后一层权重 1.0，其余层 0.3
-            weights = [0.3] * (num_layers - 1) + [1.0]
+        # 动态权重处理
+        if len(self.layer_weights) != len(layer_keys):
+            # fallback
+            weights = [1.0] * len(layer_keys)
         else:
             weights = self.layer_weights
-            assert len(weights) == num_layers, \
-                f"Config layer_weights length ({len(weights)}) does not match model outputs ({num_layers})"
 
-        # --- 循环计算每一层 Loss ---
+        # 用于存储原始数值的字典，结构扁平化以便快速累加
+        # Key: "Layer/Group/SubID" -> Value: float
+        raw_stats = {}
+        # 辅助存储，用于计算 AVG_ALL
+        # Key: "Group/SubID" -> List[float]
+        subclass_history = {}
+
+
+        # --- 双重循环：Layer -> Task ---
         for i, layer_key in enumerate(layer_keys):
-            layer_output = model_outputs[layer_key]
+            layer_output_dict = model_outputs[layer_key]  # {'road': ..., 'building': ...}
             layer_weight = weights[i]
+            layer_total_loss = 0.0  # 该层所有任务的总 Loss
 
-            current_layer_loss = 0.0
+            # 遍历每个任务头 (road, building...)
+            for task_name, logits in layer_output_dict.items():
+                if task_name not in self.tasks:
+                    continue  # 忽略未在 loss config 中定义的任务
 
-            # Case A: 多任务 (Classifier 输出 Dict)
-            if isinstance(layer_output, dict):
-                for task_name, logits in layer_output.items():
-                    # 确定对应的 Target
-                    if self.task_mapping:
-                        indices = self.task_mapping[task_name]
-                        task_target = targets[:, indices]
-                    else:
-                        # 无映射则假设对应所有
-                        task_target = targets
+                # 1. 获取对应的 Label 切片
+                start = self.tasks[task_name]['start']
+                end = self.tasks[task_name]['end']
+                # [Batch, Num_Subtasks]
+                task_target = targets[:, start:end]
 
-                    # 计算 Loss
-                    task_loss = self.criterion(logits, task_target)
-                    current_layer_loss += task_loss
+                # [AMP优化] 再次强制 Logits 转 FP32 (双重保险)
+                # --- 新增的处理逻辑 ---
+                if isinstance(logits, list):
+                    # 将列表中的多个 Tensor 沿着维度 1 (列) 拼接起来
+                    # 结果形状会变成 (Batch_Size, 8)
+                    logits = torch.cat(logits, dim=1)
+                # --------------------
+                logits = logits.float()
 
-                    # [记录] 单个任务头的 Loss
-                    loss_dict[f"{layer_key}/{task_name}"] = task_loss.item()
+                # 2. 获取对应的 Loss 函数
+                criterion = self.criteria[task_name]
+                # logits [B, Num_Subtasks]
+                raw_loss = criterion(logits, task_target)
 
-            # Case B: 单任务 (Classifier 输出 Tensor)
-            else:
-                logits = layer_output
-                task_loss = self.criterion(logits, targets)
-                current_layer_loss += task_loss
-                loss_dict[f"{layer_key}/loss"] = task_loss.item()
+                # 3. 在 Batch 维度求平均 -> [Num_Subclasses]
+                # 这就是该层、该任务中、每个子类的 Loss
+                per_subclass_loss = raw_loss.mean(dim=0)
 
-            # 累加到总 Loss (带权重)
-            total_loss += layer_weight * current_layer_loss
+                # 4. 记录每个子类的 Loss
+                for sub_idx, sub_loss in enumerate(per_subclass_loss):
+                    val = sub_loss.item()
 
-            # [记录] 该层的总 Loss (未加权的纯 Loss)
-            loss_dict[f"{layer_key}_sum"] = current_layer_loss.item()
+                    # 1. 记录层级子类 Loss
+                    raw_stats[f"{layer_key}/{task_name}/{sub_idx}"] = val
 
-        # [记录] 最终加权 Loss
-        loss_dict['total_loss'] = total_loss.item()
+                    # 2. 存入历史以计算全局平均
+                    hist_key = f"{task_name}/{sub_idx}"
+                    if hist_key not in subclass_history:
+                        subclass_history[hist_key] = []
+                    subclass_history[hist_key].append(val)
 
-        return total_loss, loss_dict
+                # 5.
+                # 计算该任务在本层的平均 (MEAN)
+                task_mean = per_subclass_loss.mean().item()
+                raw_stats[f"{layer_key}/{task_name}/MEAN"] = task_mean
+                # 计算该任务在本层的总 Loss (通常是所有子类求和)
+                layer_total_loss += per_subclass_loss.sum()
+
+
+            # 累加层级 Loss
+            total_loss += layer_weight * layer_total_loss
+            raw_stats[f"{layer_key}/ALL/SUM"] = layer_total_loss.item()
+
+        # 计算 AVG_ALL (跨层平均)
+        for hist_key, vals in subclass_history.items():
+            task_name, sub_idx = hist_key.split('/')
+            avg_val = sum(vals) / len(vals)
+            raw_stats[f"AVG_ALL/{task_name}/{sub_idx}"] = avg_val
+
+            # 同时累加用于计算 AVG_ALL 的 MEAN
+            if f"AVG_ALL/{task_name}/MEAN_list" not in raw_stats:
+                raw_stats[f"AVG_ALL/{task_name}/MEAN_list"] = []
+            raw_stats[f"AVG_ALL/{task_name}/MEAN_list"].append(avg_val)
+
+        # 计算 AVG_ALL 的 Group Mean
+        for key in list(raw_stats.keys()):
+            if "MEAN_list" in key:
+                vals = raw_stats[key]
+                raw_stats[key.replace("MEAN_list", "MEAN")] = sum(vals) / len(vals)
+                del raw_stats[key]  # 清理临时 list
+
+        raw_stats['TOTAL/ALL/SUM'] = total_loss.item()
+
+        return total_loss, raw_stats
+
+
+    @staticmethod
+    def format_loss_to_df(loss_stats_list, epoch=None):
+        """
+        将累积的 stats 列表转换为 DataFrame 表格
+        Args:
+            loss_stats_list: List[dict]，包含了每个 batch 的 raw_stats
+            epoch: int
+        Returns:
+            pd.DataFrame
+        """
+        if not loss_stats_list:
+            return pd.DataFrame()
+
+        # 1. 对所有 Batch 的 stats 求平均
+        # 先把 list of dicts 转为 dict of lists
+        agg_dict = {}
+        for stats in loss_stats_list:
+            for k, v in stats.items():
+                if k not in agg_dict:
+                    agg_dict[k] = []
+                agg_dict[k].append(v)
+
+        # 计算平均值
+        mean_stats = {k: np.mean(v) for k, v in agg_dict.items()}
+
+        # 2. 解析 Key 构建表格行
+        # Key 格式: Layer/Group/SubID
+        rows = []
+        for key, val in mean_stats.items():
+            parts = key.split('/')
+            if len(parts) == 3:
+                layer, group, sub_id = parts
+                rows.append({
+                    'Layer': layer,
+                    'Group': group,
+                    'SubID': sub_id,
+                    'Loss': round(val, 5)
+                })
+
+        # 3. 创建 DataFrame
+        df = pd.DataFrame(rows)
+
+        # 4. 排序美化
+        # 简单排序逻辑
+        df = df.sort_values(by=['Layer', 'Group', 'SubID'])
+
+        if epoch is not None:
+            df.insert(0, 'Epoch', epoch)
+
+        return df

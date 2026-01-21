@@ -5,22 +5,29 @@ import math
 import numpy as np
 
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False):
+def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False, device="cpu"):
     """
     embed_dim: 输出维度
     grid_size_h: 高度方向的网格数
     grid_size_w: 宽度方向的网格数
     """
     # 也就是 h * w
-    grid_h = np.arange(grid_size_h, dtype=np.float32)
-    grid_w = np.arange(grid_size_w, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h) # here w goes first
-    grid = np.stack(grid, axis=0)  # [2, h, w]
+    # [修改] 使用 torch.arange 替代 np.arange
+    grid_h = torch.arange(grid_size_h, dtype=torch.float32, device=device)
+    grid_w = torch.arange(grid_size_w, dtype=torch.float32, device=device)
+
+    # [修改] 使用 torch.meshgrid 替代 np.meshgrid
+    # indexing='xy' 对应 numpy 的默认行为 (第一个返回变化快(w), 第二个返回变化慢(h))
+    grid_W, grid_H = torch.meshgrid(grid_w, grid_h, indexing='xy')
+
+    # 堆叠 [2, h, w] -> grid[0] 是 W, grid[1] 是 H
+    grid = torch.stack([grid_W, grid_H], dim=0)
 
     grid = grid.reshape([2, 1, grid_size_h, grid_size_w])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+
     if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+        pos_embed = torch.cat([torch.zeros([1, embed_dim], device=device), pos_embed], dim=0)
     return pos_embed
 
 
@@ -31,7 +38,7 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
 
-    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    emb = torch.cat([emb_h, emb_w], dim=1)  # (H*W, D)
     return emb
 
 
@@ -41,18 +48,18 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     pos: a list of positions to be encoded: size (M,)
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    # 强制使用 float32 进行数学计算
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32, device=pos.device)
     omega /= embed_dim / 2.
     omega = 1. / 10000 ** omega  # (D/2,)
 
     pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+    out = torch.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
+    emb_sin = torch.sin(out)
+    emb_cos = torch.cos(out)
 
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
+    return torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
 
 
 class PositionalEmbedder2(nn.Module):
@@ -65,7 +72,6 @@ class PositionalEmbedder2(nn.Module):
         # 从 cfg 获取参数
         cfg = cfg.data
         self.dim = getattr(cfg, 'vision_dim', 4096)
-        self.batch_size = getattr(cfg, 'batch_size', 16)
         self.H_num = getattr(cfg, 'patches_h_num', 3)
         self.W_num = getattr(cfg, 'patches_w_num', 9)
 
@@ -83,13 +89,13 @@ class PositionalEmbedder2(nn.Module):
         # 1. 缓存 Local PE (Sin-Cos)
         #    因为 Local 尺寸通常相对固定，可以预先计算
         # -----------------------------------------------------------
-        local_pe_numpy = get_2d_sincos_pos_embed(
-            self.dim, self.local_grid_size, self.local_grid_size
+        local_pe_tensor = get_2d_sincos_pos_embed(
+            self.dim, self.local_grid_size, self.local_grid_size, device="cpu"
         )  # [Local_Tokens, D]
         # 注册为 buffer，不作为参数更新，但随模型保存
         self.register_buffer(
             'local_pe_cache',
-            torch.from_numpy(local_pe_numpy).float().unsqueeze(0)  # [1, Local_Tokens, D]
+            local_pe_tensor.float().unsqueeze(0)  # [1, Local_Tokens, D]
         )
 
         # -----------------------------------------------------------
@@ -98,7 +104,7 @@ class PositionalEmbedder2(nn.Module):
         self.image_embed = nn.Embedding(2, self.dim)  # 0: Pre, 1: Post
         self.type_embed = nn.Embedding(2, self.dim)  # 0: Crop, 1: Thumbnail
 
-    def forward(self, image_time=None):
+    def forward(self, input_batch_size, image_time=None):
         """
         Args:
             h_num, w_num: 当前 batch 的切片网格划分 (e.g., 3, 3)
@@ -116,8 +122,9 @@ class PositionalEmbedder2(nn.Module):
         # 1. 生成 Crop 的 Grid
         # 我们使用辅助函数直接生成 (h_num * w_num, D) 的编码
         # 注意：这里每次 forward 都会计算 sin/cos，开销很小，换来了极大的灵活性
-        global_crops_numpy = get_2d_sincos_pos_embed(self.dim, self.H_num, self.W_num)
-        global_crops = torch.from_numpy(global_crops_numpy).float().to(device)  # [H*W, D]
+        global_crops = get_2d_sincos_pos_embed(
+            self.dim, self.H_num, self.W_num, device=device
+        ) # [H*W, D]
 
         # 2. 处理 Thumbnail 的位置
         # Thumbnail 在逻辑上是全局概览，通常可以设为 Grid 的中心，或者设为 (0,0) 并依靠 Type Embedding 区分
@@ -134,13 +141,13 @@ class PositionalEmbedder2(nn.Module):
         global_pe = torch.cat([global_crops, global_thumb], dim=0)  # [Total_Tiles, D]
 
         # 扩展维度: [Total_Tiles, D] -> [B, Total_Tiles, Local_Tokens, D]
-        global_pe = global_pe.unsqueeze(0).unsqueeze(2).expand(self.batch_size, -1, self.num_local_tokens, -1)
+        global_pe = global_pe.unsqueeze(0).unsqueeze(2).expand(input_batch_size, -1, self.num_local_tokens, -1)
 
         # -----------------------------------------------------------
         # B. Local PE (直接从 Buffer 取)
         # -----------------------------------------------------------
         # [1, Local_Tokens, D] -> [B, Total_Tiles, Local_Tokens, D]
-        local_pe = self.local_pe_cache.unsqueeze(1).expand(self.batch_size, total_tiles, -1, -1)
+        local_pe = self.local_pe_cache.unsqueeze(1).expand(input_batch_size, total_tiles, -1, -1)
 
         # -----------------------------------------------------------
         # C. 属性编码 (Attributes)
@@ -155,11 +162,11 @@ class PositionalEmbedder2(nn.Module):
         if image_time is not None:
             # 处理成 [B, 1, 1, D] 以便广播
             if isinstance(image_time, int):
-                t_tensor = torch.tensor([image_time], device=device).repeat(self.batch_size)
+                t_tensor = torch.tensor([image_time], device=device).repeat(input_batch_size)
             else:
                 t_tensor = image_time
 
-            img_pe = self.image_embed(t_tensor).view(self.batch_size, 1, 1, self.dim)
+            img_pe = self.image_embed(t_tensor).view(input_batch_size, 1, 1, self.dim)
 
         # -----------------------------------------------------------
         # D. 融合
@@ -168,8 +175,6 @@ class PositionalEmbedder2(nn.Module):
         final_pos = local_pe + global_pe + type_pe + img_pe
 
         return final_pos.flatten(1, 2)
-
-
 
 
 # 测试代码
@@ -271,7 +276,7 @@ def test_unified_positional_embedder():
 
         # 比较与第一个tile的差异
         diff_to_first = torch.mean(torch.abs(tile_tokens - first_crop_tokens))
-        print(tile_tokens.shape,tile_tokens)
+        print(tile_tokens.shape, tile_tokens)
         print(first_crop_tokens)
         print(f"  位置({row},{col})与(0,0)的差异: {diff_to_first.item():.6f}")
         break

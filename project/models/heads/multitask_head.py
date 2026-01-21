@@ -18,7 +18,7 @@ class SubTaskHead(nn.Module):
             nn.Dropout(dropout),  # 防止过拟合
 
             # 第二层：最终分类
-            nn.Linear(mid_dim, 2)  # 输出 Logits
+            nn.Linear(mid_dim, 1)  # 输出 Logits
         )
 
     def forward(self, x):
@@ -131,9 +131,11 @@ class MultitaskClassifier(nn.Module):
             g_semantic_feat = self.group_mlps[g_idx](g_input)
 
             # --- Step 3: 全局聚合 ---
+            # [重要] 聚合操作涉及累加，必须转为 float32 以防止 BF16 精度丢失
+            g_semantic_feat_fp32 = g_semantic_feat.float()
             # [B, Hidden]
-            g_max = torch.max(g_semantic_feat, dim=1)[0]
-            g_avg = torch.mean(g_semantic_feat, dim=1)
+            g_max = torch.max(g_semantic_feat_fp32, dim=1)[0]
+            g_avg = torch.mean(g_semantic_feat_fp32, dim=1)
             # [B, Hidden*2]
             g_summary = torch.cat([g_max, g_avg], dim=-1)
 
@@ -142,9 +144,9 @@ class MultitaskClassifier(nn.Module):
             current_group_heads = self.sub_heads[g_idx]
 
             for head in current_group_heads:
-                # [B, 2]
+                # [B, 1]
                 logits = head(g_summary)
-                sub_results.append(logits)
+                sub_results.append(logits.float())
 
             results[group_name] = sub_results
 

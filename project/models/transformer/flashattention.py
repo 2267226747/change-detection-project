@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 from models.transformer.RMSNorm import RMSNorm
+import torch
 
 
 class FlashAttention(nn.Module):
@@ -53,14 +54,26 @@ class FlashAttention(nn.Module):
             key:   [B, L_k, kv_dim]
             value: [B, L_k, kv_dim]
         """
+
+
+        # 记录输入数据类型
+        # print(f"[FlashAttention] 输入数据类型: query={query.dtype}, key={key.dtype}, value={value.dtype}")
+
         B, L_q, _ = query.shape
         _, L_k, _ = key.shape
+
+        # 打印调试信息
+        # print(f"[FlashAttention] 输入形状: query={query.shape}, key={key.shape}, value={value.shape}")
+        # print(f"[FlashAttention] 配置: num_heads={self.num_heads}, head_dim={self.head_dim}")
 
         # 1. 投影
         # 经过这里后，q, k, v 的最后一维都变成了 self.q_dim
         q = self.q_proj(query)  # [B, L_q, q_dim]
         k = self.k_proj(key)  # [B, L_k, q_dim]
         v = self.v_proj(value)  # [B, L_k, q_dim]
+
+        # 再次打印投影后的形状
+        # print(f"[FlashAttention] 投影后: q={q.shape}, k={k.shape}, v={v.shape}")
 
         # 2. Reshape 为 [Batch, SeqLen, NumHeads, HeadDim]
         # 并转置为 [Batch, NumHeads, SeqLen, HeadDim] 以适配 FlashAttention

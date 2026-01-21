@@ -123,6 +123,7 @@ class FusionTransformerBlock2(nn.Module):
 
         # 1. Siamese Cross-Attention (分别交互)
         if self.if_query:
+            # print("query")
             assert vision_1 is not None and vision_2 is not None, "if_cross=True but Vision features missing"
             # 准备 Key 和 Value
             # 默认 Key/Value 就是 vision_t，根据 flag 叠加位置编码
@@ -152,7 +153,7 @@ class FusionTransformerBlock2(nn.Module):
         # 2. Fusion (融合 F1 和 F2)
         # 如果该层 block 进行 query vision feature，则不进行query token之间的交互
         else:
-
+            # print("fusion")
             if self.fusion_type == 'cross_attn':
                 # 使用 F1 去查询 F2 的信息 (F1 -> F2)
                 # Query = F1, Key/Value = F2

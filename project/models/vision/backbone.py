@@ -52,7 +52,7 @@ class VisionEncoder(nn.Module):
         # --- [新增代码] Pixel Unshuffle & MLP 配置 ---
         # 1. 获取目标维度 (LLM 的 hidden size，例如 4096), 下采样比率 (默认 0.5)
         # 在 cfg.model.hidden_dim 中定义，如果没有则默认 4096
-        self.target_dim = getattr(cfg.model, 'hidden_dim', 4096)
+        self.target_dim = getattr(cfg.model.vision, 'vision_dim', 4096)
         self.downsample_ratio = getattr(cfg.model.vision, 'downsample_ratio', 0.5)
 
         # 2. 计算 Scale 和 输入通道数
