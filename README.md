@@ -1,10 +1,10 @@
----
 # Change Detection Project with InternViT & RL
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+---
 ## 📖 项目概述 (Project Overview)
 
 本项目实现了一个高精度的多标签变化检测框架，专为处理复杂的街景影像（SVI）变化检测任务而设计。系统采用“Sensing-Reasoning”交替的 Transformer 架构，结合强大的 InternViT 视觉编码器，实现对双时相图像的深度特征融合与理解。
@@ -44,8 +44,8 @@ graph TD
         PE[Positional Embedder]
         
         subgraph "Transformer Layers (Alternating)"
-            SL[Sensing Layer (Even)]
-            RL[Reasoning Layer (Odd)]
+            SL["Sensing Layer (Even)"]
+            RL["Reasoning Layer (Odd)"]
             SL -- Query Interaction --> RL
             VE -- Visual Feat --> SL
         end
@@ -195,6 +195,5 @@ MIT License
 *Created by Project Team*
 
 ```
-
 
 ```
