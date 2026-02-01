@@ -1,3 +1,0 @@
-# Step 1 专用参数
-epochs: 50
-stage: 'warmup'
